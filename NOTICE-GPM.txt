@@ -1,0 +1,10 @@
+This package is a mirror of Google's External Dependency Manager for Unity
+(Unity JAR Resolver) maintained by GPM.
+
+Original source: https://github.com/googlesamples/unity-jar-resolver/tree/master/upm
+License: Apache-2.0
+
+GPM modifications are limited to:
+- Package metadata and versioning
+- Mirror automation infrastructure
+- No changes to core functionality

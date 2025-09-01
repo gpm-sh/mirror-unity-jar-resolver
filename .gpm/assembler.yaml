@@ -1,0 +1,31 @@
+package:
+  id: "registry.gpm.sh/com.google.external-dependency-manager"
+  displayName: "External Dependency Manager for Unity (GPM Mirror)"
+  upstreamLayout: "upm"
+  repack:
+    toUPM: true
+    source: "upm"
+    map:
+      "ExternalDependencyManager": "."
+  asmdef:
+    runtime:
+      name: "com.google.external-dependency-manager"
+      references: []
+      includePlatforms: []
+      excludePlatforms: []
+      allowUnsafeCode: false
+      autoReferenced: true
+    editor:
+      name: "com.google.external-dependency-manager.editor"
+      references: ["com.google.external-dependency-manager"]
+      includePlatforms: ["Editor"]
+      excludePlatforms: []
+      allowUnsafeCode: false
+      autoReferenced: true
+  versioning:
+    scheme: "suffix"
+    suffix: "-gpm.1"
+  legal:
+    requireLicense: true
+    requireNotice: false
+    noteChanges: true

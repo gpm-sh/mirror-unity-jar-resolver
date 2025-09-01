@@ -1,0 +1,10 @@
+{
+  "upstream": "https://github.com/googlesamples/unity-jar-resolver",
+  "license": "Apache-2.0",
+  "gpm_modifications": [
+    "Converted from upm folder to standalone UPM package",
+    "Added GPM versioning suffix",
+    "Preserved original Unity package structure"
+  ],
+  "last_sync": ""
+}

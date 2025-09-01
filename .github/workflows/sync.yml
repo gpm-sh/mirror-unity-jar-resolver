@@ -1,0 +1,262 @@
+name: Sync Unity JAR Resolver → Tag → Publish (auto)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_override:
+        description: "Upstream tag (e.g., v1.2.186). Leave empty to backfill latest N."
+        required: false
+        default: ""
+      max_tags:
+        description: "How many latest missing tags to backfill if no override."
+        required: false
+        default: "3"
+  schedule:
+    - cron: "17 3 * * *"  # daily
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_URL_FILE: .gpm/upstream.url
+  PACKAGE_JSON: package.json
+  PACKAGE_NAME: com.google.external-dependency-manager
+  REGISTRY: https://registry.gpm.sh
+
+jobs:
+  sync_tag_publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - name: Tooling
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq git
+
+      - name: Setup Node (for pack/publish)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          
+      - name: Configure git identity
+        run: |
+          git config --global user.name "GPM Mirror Bot"
+          git config --global user.email "gpm-mirror@gpm.sh"
+
+      - name: Configure npm auth
+        run: |
+          mkdir -p ~/.npm
+          cat > ~/.npmrc <<'NPMRC'
+          registry=${{ env.REGISTRY }}
+          //registry.gpm.sh/:_authToken=${GPM_TOKEN}
+          fetch-timeout=60000
+          NPMRC
+        env:
+          GPM_TOKEN: ${{ secrets.GPM_TOKEN }}
+
+      - name: Read upstream URL
+        id: upstream
+        run: |
+          URL="$(tr -d '\n' < ${UPSTREAM_URL_FILE} | xargs)"
+          [ -n "$URL" ] || { echo "::error::Missing .gpm/upstream.url"; exit 1; }
+          echo "url=$URL" >> $GITHUB_OUTPUT
+
+      - name: Collect upstream tags
+        id: tags
+        run: |
+          git ls-remote --tags "${{ steps.upstream.outputs.url }}" \
+            | awk '{print $2}' | sed 's#refs/tags/##' | sed 's/\^{}//' \
+            | grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+(-.*)?$' \
+            | sort -Vr > /tmp/upstream_tags.txt
+          echo "count=$(wc -l < /tmp/upstream_tags.txt)" >> $GITHUB_OUTPUT
+
+      - name: Build worklist (missing tags)
+        id: work
+        env:
+          TAG_OVERRIDE: ${{ inputs.tag_override }}
+          MAX_TAGS: ${{ inputs.max_tags }}
+        run: |
+          set -e
+          if [ -n "$TAG_OVERRIDE" ]; then
+            echo "$TAG_OVERRIDE" > /tmp/work.txt
+            echo "has_work=true" >> $GITHUB_OUTPUT
+          else
+            # Local base tags are like vX.Y.Z (strip -gpm.* when comparing)
+            git tag -l | sed 's/-gpm\..*$//' | sort -u -Vr > /tmp/local_base_tags.txt || true
+            awk 'NR==FNR{have[$0]=1; next} {t=$0; if(!(t in have)) print t}' /tmp/local_base_tags.txt /tmp/upstream_tags.txt > /tmp/missing.txt
+            head -n "${MAX_TAGS:-3}" /tmp/missing.txt > /tmp/work.txt
+            if [ -s /tmp/work.txt ]; then
+              echo "has_work=true" >> $GITHUB_OUTPUT
+            else
+              echo "has_work=false" >> $GITHUB_OUTPUT
+            fi
+          fi
+          echo "Has work?"; test -s /tmp/work.txt && echo yes || echo no
+
+      - name: Nothing to do
+        if: ${{ steps.work.outputs.has_work != 'true' }}
+        run: echo "No missing upstream tags."
+
+      - name: Process each tag (sync → commit → tag → publish)
+        if: ${{ steps.work.outputs.has_work == 'true' }}
+        env:
+          GPM_TOKEN: ${{ secrets.GPM_TOKEN }}
+        run: |
+          set -e
+          while read -r TAG; do
+            [ -n "$TAG" ] || continue
+            echo "===== Processing $TAG ====="
+
+            # Clone upstream at tag
+            rm -rf _upstream
+            git clone --depth 1 --branch "$TAG" "${{ steps.upstream.outputs.url }}" _upstream
+
+            # Ensure we're on main and up to date
+            git checkout main
+            git pull --ff-only || true
+
+            # Clean payload but keep control files
+            find . -maxdepth 1 -mindepth 1 \
+              ! -name ".git" \
+              ! -name ".github" \
+              ! -name ".gpm" \
+              ! -name "_upstream" \
+              ! -name "${PACKAGE_JSON}" \
+              ! -name "README.md" \
+              ! -name "NOTICE-GPM.txt" \
+              ! -name "CHANGES-GPM.md" \
+              ! -name "LICENSE" \
+              ! -name "LICENCE" \
+              ! -name ".gitignore" \
+              ! -name ".npmignore" \
+              -exec rm -rf {} +
+
+
+            # Copy Unity JAR Resolver from upm folder → repo root
+            SRC="_upstream/upm"
+            if [ ! -d "$SRC" ]; then
+              echo "::error::Expected $SRC not found for $TAG"
+              echo "Available directories in _upstream/:"
+              ls -la _upstream/ || true
+              exit 1
+            fi
+            
+            # Copy all files including .meta files (preserve Unity asset references)
+            echo "Copying all files including meta files from upstream upm folder..."
+            shopt -s dotglob
+            cp -R "$SRC/"* ./
+
+            # LICENSE + optional NOTICE
+            [ -f "_upstream/LICENSE" ] && cp _upstream/LICENSE LICENSE || true
+            [ -f "_upstream/NOTICE"  ] && cp _upstream/NOTICE  NOTICE  || true
+
+            # Keep original assembly definitions from upstream
+            echo "Preserving original assembly definitions and meta files from upstream..."
+
+            # Create/update .gitignore to exclude build artifacts
+            echo "# NPM package files" > .gitignore
+            echo "*.tgz" >> .gitignore
+            echo "" >> .gitignore
+            echo "# All Unity meta files are preserved and committed" >> .gitignore
+            echo "# They are essential for proper Unity package integration" >> .gitignore
+            echo "" >> .gitignore
+            echo "# Temporary files" >> .gitignore
+            echo "*.tmp" >> .gitignore
+            echo "*.log" >> .gitignore
+            echo "" >> .gitignore
+            echo "# Build artifacts" >> .gitignore
+            echo "pack.json" >> .gitignore
+            echo "*.tmp" >> .gitignore
+            echo "" >> .gitignore
+            echo "# Temporary directories" >> .gitignore
+            echo "_upstream/" >> .gitignore
+
+            # Create/update .npmignore to control what gets published
+            echo "# Development and build files" > .npmignore
+            echo ".git/" >> .npmignore
+            echo ".github/" >> .npmignore
+            echo ".gpm/" >> .npmignore
+            echo "_upstream/" >> .npmignore
+            echo "*.log" >> .npmignore
+            echo "*.tmp" >> .npmignore
+            echo "pack.json" >> .npmignore
+            echo "" >> .npmignore
+            echo "# Documentation that shouldn't be in the package" >> .npmignore
+            echo "README.md" >> .npmignore
+            echo "CHANGES-GPM.md" >> .npmignore
+            echo "NOTICE-GPM.txt" >> .npmignore
+            echo "" >> .npmignore
+            echo "# License files (LICENSE will be included automatically by npm)" >> .npmignore
+            echo "LICENCE" >> .npmignore
+            echo "" >> .npmignore
+            echo "# Unity Editor specific files that shouldn't be in UPM packages" >> .npmignore
+            #echo "*.meta" >> .npmignore
+            echo "" >> .npmignore
+            echo "# NPM artifacts" >> .npmignore
+            echo "*.tgz" >> .npmignore
+            echo "node_modules/" >> .npmignore
+            echo "" >> .npmignore
+            echo "# Temporary files" >> .npmignore
+            echo "*.temp" >> .npmignore
+            echo "*.bak" >> .npmignore
+            echo "*.swp" >> .npmignore
+            echo "*~" >> .npmignore
+
+            # Clean up temporary and unnecessary files
+            echo "Cleaning up temporary files..."
+            rm -rf _upstream/
+            rm -f pack.json
+            rm -f package.json.tmp
+            rm -f .gpm/provenance.json.tmp
+
+            # Ensure package.json exists
+            if [ ! -f "${PACKAGE_JSON}" ]; then
+              echo "::error::${PACKAGE_JSON} missing at repo root."
+              exit 1
+            fi
+
+            # Set UPM name and bump version: X.Y.Z-gpm.1
+            BASE="${TAG#v}"
+            VER="${BASE}-gpm.1"
+            jq --arg name "${PACKAGE_NAME}" \
+               --arg disp "External Dependency Manager for Unity (GPM Mirror)" \
+               --arg ver "$VER" \
+               '.name=$name | .displayName=$disp | .version=$ver' \
+               "${PACKAGE_JSON}" > package.json.tmp && mv package.json.tmp "${PACKAGE_JSON}"
+
+            # Stamp provenance last_sync
+            ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            jq --arg ts "$ts" '.last_sync=$ts' .gpm/provenance.json > .gpm/provenance.json.tmp && mv .gpm/provenance.json.tmp .gpm/provenance.json
+
+            # Commit straight to main
+            git add -A
+            git commit -m "chore(sync): ${TAG} → ${VER} (auto)" || echo "no changes"
+            git push origin main
+
+            # Create/force tag v<version>
+            git tag -f "v${VER}"
+            git push -f origin "v${VER}"
+
+            # Skip publish if version exists
+            if npm view "${PACKAGE_NAME}@${VER}" version --registry=${{ env.REGISTRY }} >/dev/null 2>&1; then
+              echo "Version ${VER} already published — skipping publish."
+              continue
+            fi
+
+            # Pack + Publish
+            npm pack --json | tee pack.json
+            TARBALL="$(jq -r '.[0].filename' pack.json)"
+            echo "Tarball: $TARBALL"
+            npm publish --registry=${{ env.REGISTRY }}
+            
+            # Clean up pack artifacts
+            rm -f pack.json
+
+            # Optionally set dist-tag latest
+            # npm dist-tag add "${PACKAGE_NAME}@${VER}" latest --registry=${{ env.REGISTRY }}
+
+            echo "===== Done $TAG → ${VER} ====="
+          done < /tmp/work.txt

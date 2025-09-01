@@ -1,0 +1,16 @@
+# NPM package files
+*.tgz
+
+# All Unity meta files are preserved and committed
+# They are essential for proper Unity package integration
+
+# Temporary files
+*.tmp
+*.log
+
+# Build artifacts
+pack.json
+*.tmp
+
+# Temporary directories
+_upstream/
